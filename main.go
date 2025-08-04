@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -9,8 +11,9 @@ import (
 )
 
 type RequestWthTimestamp struct {
-	request   *http.Request
-	timestamp time.Time
+	requestBody    []byte
+	requestHeaders http.Header
+	timestamp      time.Time
 }
 
 type ConnectionMeta struct {
@@ -95,14 +98,24 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			panic(err)
 		}
 		req.Header = r.Header
-		rwh.client.Do(req)
+		resp, err := rwh.client.Do(req)
+		if err != nil {
+			panic(err)
+		}
+		_ = resp // TODO error handling
 		rwh.lastRequestFromActive <- time.Now()
 	case STATUS_BACKUP:
 		logger.Debug("handling request from backup source")
 
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			panic(err)
+		}
+
 		req := &RequestWthTimestamp{
-			request:   r,
-			timestamp: time.Now(),
+			requestBody:    body,
+			requestHeaders: r.Header,
+			timestamp:      time.Now(),
 		}
 		if tc.storedRequests[tc.currentIndex] == nil {
 			logger.Debug("storing request in empty slot", zap.Int("index", tc.currentIndex))
@@ -181,7 +194,7 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, expirationDuration time.Duration, lastRequestChan <-chan time.Time, quitChan <-chan struct{}) {
+func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, expirationDuration time.Duration, lastRequestChan <-chan time.Time, quitChan <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 
 	var lastRequest time.Time
@@ -202,8 +215,8 @@ func watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, exp
 			for k, v := range statusMap {
 				logger.Debug("status map entry", zap.String("remote addr", string(k)), zap.Int("status", int(v.status)))
 			}
-			// TODO i need to rewrite this so that it is fully atomic and it doesn't switch both of them to STATUS_STALE
 			switchingLock.Lock()
+			// TODO conjure up something better than hardcoding basically the equivalent of a magic sleep where it can't switch again
 			if time.Since(timeOfLastSwitch) < time.Minute {
 				logger.Info("switched within the last minute, waiting to stabilize")
 				switchingLock.Unlock()
@@ -223,10 +236,10 @@ func watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, exp
 					}
 				}
 
-				found := false
+				var found *ConnectionMeta
 				for k, v := range statusMap {
 					if v.status == STATUS_BACKUP {
-						found = true
+						found = &v
 						v.status = STATUS_ACTIVE
 						statusMap[k] = v
 						timeOfLastSwitch = time.Now()
@@ -234,8 +247,34 @@ func watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, exp
 					}
 				}
 
-				if !found {
+				if found == nil {
 					logger.Error("no available backup connections")
+				} else {
+					logger.Info("replaying captured requests since last request from active")
+					i := -1
+					for j, sr := range found.storedRequests {
+						if sr == nil {
+							continue
+						}
+						if sr.timestamp.After(lastRequest) {
+							if i < 0 {
+								i = j
+							}
+							req, err := http.NewRequest(http.MethodPost, "http://localhost:9092/api/v1/write", bytes.NewReader(sr.requestBody))
+							if err != nil {
+								panic(err)
+							}
+							req.Header = sr.requestHeaders
+							resp, err := rwh.client.Do(req)
+							if err != nil {
+								panic(err)
+							}
+							_ = resp // TODO error handling
+						}
+					}
+					if i >= 0 {
+						found.currentIndex = i
+					}
 				}
 				logger.Debug("release lock at position H")
 				mapmutex.Unlock()
@@ -280,7 +319,7 @@ func main() {
 		Handler: mux,
 	}
 
-	go watchdog(&mapmutex, statusMap, rwh.expirationDuration, lastRequestChan, quitChan)
+	go rwh.watchdog(&mapmutex, statusMap, rwh.expirationDuration, lastRequestChan, quitChan)
 	logger.Info("started on :8080")
 
 	err := server.ListenAndServe()
