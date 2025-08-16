@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    prometheus_replica: replica-1
+
+scrape_configs:
+  - job_name: "prometheus-0"
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: "prometheus-1"
+    static_configs:
+      - targets: ["localhost:9091"]
+
+remote_write:
+  - url: http://prometheus-central:9090/api/v1/write
+#    protobuf_message: io.prometheus.write.v2.Request
