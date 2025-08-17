@@ -3,13 +3,13 @@ services:
     image: prom/prometheus:v3.5.0
     container_name: prometheus1
     volumes:
-      - ./prom0:/etc/prometheus
+      - ./prom1:/etc/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yaml'
       - '--web.listen-address=:9091'
       - '--storage.tsdb.path=/prometheus'
     ports:
-      - "9091:9091"
+      - 9091:9091
     depends_on:
       - prometheus-central
 
@@ -17,13 +17,13 @@ services:
     image: prom/prometheus:v3.5.0
     container_name: prometheus2
     volumes:
-      - ./prom1:/etc/prometheus
+      - ./prom2:/etc/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yaml'
       - '--web.listen-address=:9092'
       - '--storage.tsdb.path=/prometheus'
     ports:
-      - "9092:9092"
+      - 9092:9092
     depends_on:
       - prometheus-central
 
@@ -38,4 +38,4 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-remote-write-receiver'
     ports:
-      - "9090:9090"
+      - 9090:9090

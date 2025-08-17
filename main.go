@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -25,11 +26,10 @@ type ConnectionMeta struct {
 }
 
 type RemoteWriteHandler struct {
-	client             *http.Client
-	expirationDuration time.Duration
-	mapmutex           *sync.Mutex
-	connmap            map[RemoteAddr]ConnectionMeta
-
+	client                *http.Client
+	expirationDuration    time.Duration
+	syncedConnectionMap   *sync.Map // treat as map[RemoteAddr]*ConnectionMeta
+	connectionCount       atomic.Int32
 	lastRequestFromActive chan<- time.Time
 }
 
@@ -57,15 +57,13 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		"X-Prometheus-Remote-Write-Version":["0.1.0"]
 	}
 	*/
-	logger.Debug("take lock at position A")
-	rwh.mapmutex.Lock()
-	logger.Debug("took lock at position A")
 	ra := RemoteAddr(r.RemoteAddr)
-	tc, ok := rwh.connmap[ra]
+
+	_, ok := rwh.syncedConnectionMap.Load(ra)
 	if !ok {
 		logger.Debug("no entry found", zap.String("remoteAddress", string(ra)))
 		var incstatus Status
-		if len(rwh.connmap) < 1 {
+		if rwh.connectionCount.Load() < 1 {
 			logger.Debug("connmap empty, setting active")
 			incstatus = STATUS_ACTIVE
 		} else {
@@ -74,26 +72,25 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 
 		requestSliceSize := 10
-		newConn := ConnectionMeta{
+		newConn := &ConnectionMeta{
 			currentIndex:     0,
 			status:           incstatus,
 			requestMutex:     &sync.Mutex{},
 			requestSliceSize: requestSliceSize,
 			storedRequests:   make([]*RequestWthTimestamp, requestSliceSize),
 		}
-		rwh.connmap[ra] = newConn
-		tc = rwh.connmap[ra]
+		rwh.syncedConnectionMap.Store(ra, newConn)
+		rwh.connectionCount.Add(1)
 	}
-	logger.Debug("release lock at position A")
-	rwh.mapmutex.Unlock()
-	logger.Debug("released lock at position A")
+	tcRaw, _ := rwh.syncedConnectionMap.Load(ra)
+	tc := tcRaw.(*ConnectionMeta)
 
 	logger.Debug("working with this connection", zap.String("remoteAddress", string(ra)), zap.Int("status", int(tc.status)))
 
 	switch tc.status {
 	case STATUS_ACTIVE:
 		logger.Info("passing through request", zap.String("source", r.RemoteAddr))
-		req, err := http.NewRequest(http.MethodPost, "http://localhost:9092/api/v1/write", r.Body)
+		req, err := http.NewRequest(http.MethodPost, "http://localhost:9090/api/v1/write", r.Body)
 		if err != nil {
 			panic(err)
 		}
@@ -194,7 +191,7 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[RemoteAddr]ConnectionMeta, expirationDuration time.Duration, lastRequestChan <-chan time.Time, quitChan <-chan struct{}) {
+func (rwh *RemoteWriteHandler) watchdog(lastRequestChan <-chan time.Time, quitChan <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 
 	var lastRequest time.Time
@@ -212,9 +209,12 @@ func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[Remo
 		select {
 		case <-ticker.C:
 			logger.Info("tick", zap.Int64("lastRequest", lastRequest.Unix()), zap.Int64("lastSwitch", timeOfLastSwitch.Unix()))
-			for k, v := range statusMap {
+			rwh.syncedConnectionMap.Range(func(key, value any) bool {
+				k := key.(RemoteAddr)
+				v := value.(*ConnectionMeta)
 				logger.Debug("status map entry", zap.String("remote addr", string(k)), zap.Int("status", int(v.status)))
-			}
+				return true
+			})
 			switchingLock.Lock()
 			// TODO conjure up something better than hardcoding basically the equivalent of a magic sleep where it can't switch again
 			if time.Since(timeOfLastSwitch) < time.Minute {
@@ -223,29 +223,32 @@ func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[Remo
 				break
 			}
 
-			if time.Since(lastRequest) > expirationDuration && len(statusMap) > 0 {
+			if time.Since(lastRequest) > rwh.expirationDuration && rwh.connectionCount.Load() > 0 {
 				logger.Info("last request was received longer ago than expiration duration, switching")
-				logger.Debug("take lock at position H")
-				mapmutex.Lock()
-				logger.Debug("took lock at position H")
 
-				for k, v := range statusMap {
+				rwh.syncedConnectionMap.Range(func(key, value any) bool {
+					k := key.(RemoteAddr)
+					v := value.(*ConnectionMeta)
 					if v.status == STATUS_ACTIVE {
 						v.status = STATUS_STALE
-						statusMap[k] = v
+						rwh.syncedConnectionMap.Store(k, v)
 					}
-				}
+					return true
+				})
 
 				var found *ConnectionMeta
-				for k, v := range statusMap {
+				rwh.syncedConnectionMap.Range(func(key, value any) bool {
+					k := key.(RemoteAddr)
+					v := value.(*ConnectionMeta)
 					if v.status == STATUS_BACKUP {
-						found = &v
 						v.status = STATUS_ACTIVE
-						statusMap[k] = v
+						rwh.syncedConnectionMap.Store(k, v)
+						found = v
 						timeOfLastSwitch = time.Now()
-						break
+						return false
 					}
-				}
+					return true
+				})
 
 				if found == nil {
 					logger.Error("no available backup connections")
@@ -260,7 +263,7 @@ func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[Remo
 							if i < 0 {
 								i = j
 							}
-							req, err := http.NewRequest(http.MethodPost, "http://localhost:9092/api/v1/write", bytes.NewReader(sr.requestBody))
+							req, err := http.NewRequest(http.MethodPost, "http://localhost:9090/api/v1/write", bytes.NewReader(sr.requestBody))
 							if err != nil {
 								panic(err)
 							}
@@ -276,9 +279,6 @@ func (rwh *RemoteWriteHandler) watchdog(mapmutex *sync.Mutex, statusMap map[Remo
 						found.currentIndex = i
 					}
 				}
-				logger.Debug("release lock at position H")
-				mapmutex.Unlock()
-				logger.Debug("released lock at position H")
 			}
 			switchingLock.Unlock()
 		case <-quitChan:
@@ -297,8 +297,7 @@ func init() {
 }
 
 func main() {
-	mapmutex := sync.Mutex{}
-	statusMap := make(map[RemoteAddr]ConnectionMeta)
+	syncedConnectionMap := &sync.Map{}
 	client := http.Client{}
 	lastRequestChan := make(chan time.Time)
 	quitChan := make(chan struct{})
@@ -306,8 +305,8 @@ func main() {
 	rwh := RemoteWriteHandler{
 		client:                &client,
 		expirationDuration:    time.Minute,
-		mapmutex:              &mapmutex,
-		connmap:               statusMap,
+		syncedConnectionMap:   syncedConnectionMap,
+		connectionCount:       atomic.Int32{},
 		lastRequestFromActive: lastRequestChan,
 	}
 
@@ -315,12 +314,12 @@ func main() {
 	mux.Handle("/write", &rwh)
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    "0.0.0.0:8080",
 		Handler: mux,
 	}
 
-	go rwh.watchdog(&mapmutex, statusMap, rwh.expirationDuration, lastRequestChan, quitChan)
-	logger.Info("started on :8080")
+	go rwh.watchdog(lastRequestChan, quitChan)
+	logger.Info("started on 0.0.0.0:8080")
 
 	err := server.ListenAndServe()
 	quitChan <- struct{}{}
