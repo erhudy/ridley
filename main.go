@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,10 +19,10 @@ type RequestWthTimestamp struct {
 }
 
 type ConnectionMeta struct {
-	currentIndex     int
+	currentIndex     atomic.Int32
 	status           Status
 	requestMutex     *sync.Mutex
-	requestSliceSize int
+	requestSliceSize int32
 	storedRequests   []*RequestWthTimestamp
 }
 
@@ -71,9 +72,9 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			incstatus = STATUS_BACKUP
 		}
 
-		requestSliceSize := 10
+		var requestSliceSize int32 = 10
 		newConn := &ConnectionMeta{
-			currentIndex:     0,
+			currentIndex:     atomic.Int32{},
 			status:           incstatus,
 			requestMutex:     &sync.Mutex{},
 			requestSliceSize: requestSliceSize,
@@ -109,83 +110,40 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			panic(err)
 		}
 
+		logger.Debug("take lock at position B")
+		tc.requestMutex.Lock()
+		logger.Debug("took lock at position B")
 		req := &RequestWthTimestamp{
 			requestBody:    body,
 			requestHeaders: r.Header,
 			timestamp:      time.Now(),
 		}
-		if tc.storedRequests[tc.currentIndex] == nil {
-			logger.Debug("storing request in empty slot", zap.Int("index", tc.currentIndex))
-			logger.Debug("take lock at position B")
-			tc.requestMutex.Lock()
-			logger.Debug("took lock at position B")
-			tc.storedRequests[tc.currentIndex] = req
-			logger.Debug("release lock at position B")
-			tc.requestMutex.Unlock()
-			logger.Debug("released lock at position B")
+		if tc.storedRequests[tc.currentIndex.Load()] == nil {
+			logger.Debug("storing request in empty slot", zap.Int32("index", tc.currentIndex.Load()))
+
+			tc.storedRequests[tc.currentIndex.Load()] = req
 		} else {
-			logger.Debug("storing request in occupied slot", zap.Int("index", tc.currentIndex))
-			if time.Since(tc.storedRequests[tc.currentIndex].timestamp) < rwh.expirationDuration {
-				logger.Debug("request in index has not expired yet, enlarging slice", zap.Int("index", tc.currentIndex))
-				logger.Debug("take lock at position C")
-				tc.requestMutex.Lock()
-				logger.Debug("took lock at position C")
-				oldSliceSize := tc.requestSliceSize
-				// replace the slice with a larger one if we are overrunning
-				newSliceSize := tc.requestSliceSize * 2
-				newStoredRequests := make([]*RequestWthTimestamp, newSliceSize)
-				for i := 0; i < tc.currentIndex; i++ {
-					newStoredRequests = append(newStoredRequests, tc.storedRequests[i])
-				}
-				for i := tc.currentIndex + oldSliceSize; i < tc.requestSliceSize; i++ {
-					newStoredRequests[i] = tc.storedRequests[i-oldSliceSize]
-				}
-				newStoredRequests[tc.currentIndex] = req
-				tc.requestSliceSize = newSliceSize
-				tc.storedRequests = newStoredRequests
-				logger.Debug("release lock at position C")
-				tc.requestMutex.Unlock()
-				logger.Debug("released lock at position C")
+			logger.Debug("storing request in occupied slot", zap.Int32("index", tc.currentIndex.Load()))
+			if time.Since(tc.storedRequests[tc.currentIndex.Load()].timestamp) < rwh.expirationDuration {
+				logger.Debug("request in index has not expired yet, enlarging slice", zap.Int32("index", tc.currentIndex.Load()))
+				tc.storedRequests = slices.Grow(tc.storedRequests, int(tc.requestSliceSize*2))
 			} else {
-				logger.Debug("overwriting request", zap.Int("index", tc.currentIndex))
-				logger.Debug("take lock at position D")
-				tc.requestMutex.Lock()
-				logger.Debug("took lock at position D")
-				tc.storedRequests[tc.currentIndex] = req
-				logger.Debug("release lock at position D")
-				tc.requestMutex.Unlock()
-				logger.Debug("released lock at position D")
+				tc.storedRequests[tc.currentIndex.Load()] = req
 			}
 		}
-		logger.Debug("incrementing index", zap.Int("index", tc.currentIndex))
-		logger.Debug("take lock at position E")
-		tc.requestMutex.Lock()
-		logger.Debug("took lock at position E")
-		tc.currentIndex += 1
-		logger.Debug("release lock at position E")
+		logger.Debug("release lock at position B")
 		tc.requestMutex.Unlock()
-		logger.Debug("released lock at position E")
-		logger.Debug("incremented index", zap.Int("index", tc.currentIndex))
-		if tc.currentIndex == tc.requestSliceSize {
-			logger.Debug("index wrapped around, resetting")
-			logger.Debug("take lock at position F")
-			tc.requestMutex.Lock()
-			logger.Debug("took lock at position F")
-			tc.currentIndex = 0
-			logger.Debug("release lock at position F")
-			tc.requestMutex.Unlock()
-			logger.Debug("released lock at position F")
+		logger.Debug("released lock at position B")
+		logger.Debug("incrementing index", zap.Int32("index", tc.currentIndex.Load()))
+		tc.currentIndex.Add(1)
+		logger.Debug("incremented index", zap.Int32("index", tc.currentIndex.Load()))
+		if tc.currentIndex.Load() == tc.requestSliceSize {
+			tc.currentIndex.Store(0)
 		}
 
 	case STATUS_STALE:
 		logger.Info("stale connection is back online", zap.String("source", r.RemoteAddr))
-		logger.Debug("take lock at position G")
-		tc.requestMutex.Lock()
-		logger.Debug("took lock at position G")
 		tc.status = STATUS_BACKUP
-		logger.Debug("release lock at position G")
-		tc.requestMutex.Unlock()
-		logger.Debug("released lock at position G")
 	default:
 		logger.Info("ignoring request from unrecognized source", zap.String("source", r.RemoteAddr), zap.Int("status", int(tc.status)))
 	}
@@ -229,10 +187,12 @@ func (rwh *RemoteWriteHandler) watchdog(lastRequestChan <-chan time.Time, quitCh
 				rwh.syncedConnectionMap.Range(func(key, value any) bool {
 					k := key.(RemoteAddr)
 					v := value.(*ConnectionMeta)
+					v.requestMutex.Lock()
 					if v.status == STATUS_ACTIVE {
 						v.status = STATUS_STALE
 						rwh.syncedConnectionMap.Store(k, v)
 					}
+					v.requestMutex.Unlock()
 					return true
 				})
 
@@ -240,13 +200,16 @@ func (rwh *RemoteWriteHandler) watchdog(lastRequestChan <-chan time.Time, quitCh
 				rwh.syncedConnectionMap.Range(func(key, value any) bool {
 					k := key.(RemoteAddr)
 					v := value.(*ConnectionMeta)
+					v.requestMutex.Lock()
 					if v.status == STATUS_BACKUP {
 						v.status = STATUS_ACTIVE
 						rwh.syncedConnectionMap.Store(k, v)
 						found = v
 						timeOfLastSwitch = time.Now()
+						v.requestMutex.Unlock()
 						return false
 					}
+					v.requestMutex.Unlock()
 					return true
 				})
 
@@ -276,7 +239,7 @@ func (rwh *RemoteWriteHandler) watchdog(lastRequestChan <-chan time.Time, quitCh
 						}
 					}
 					if i >= 0 {
-						found.currentIndex = i
+						found.currentIndex.Store(int32(i))
 					}
 				}
 			}
