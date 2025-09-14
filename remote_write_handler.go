@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
+	"github.com/xorcare/pointer"
 	"go.uber.org/zap"
 )
 
@@ -44,35 +45,95 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func processReplica(replicaChan chan RequestWthTimestamp, conntrackMutex *sync.Mutex) {
-	for x := range replicaChan {
-		logger.Debug("processReplica handling request", zap.String("replica", x.requestHeaders.Get(HEADER_X_RIDLEY_REPLICA)))
+func (rwh *RemoteWriteHandler) processReplica(replicaChan chan RequestWthTimestamp) {
+	for request := range replicaChan {
+		replica := request.requestHeaders.Get(HEADER_X_RIDLEY_REPLICA)
+		logger.Debug("processReplica handling request", zap.String("replica", replica))
+
+		if rwh.connTracker.activeLastRequestTimestamp == nil {
+			logger.Info("last request timestamp is nil, still starting up")
+		} else {
+			logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(*rwh.connTracker.activeLastRequestTimestamp)))
+			if time.Since(*rwh.connTracker.activeLastRequestTimestamp) > timeoutDuration {
+				logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", timeoutDuration))
+				if rwh.connTracker.activeConnection == replica {
+					continue
+				} else {
+					rwh.connTracker.activeConnection = replica
+				}
+			}
+		}
+
+		if rwh.connTracker.activeConnection == replica {
+			logger.Debug("forwarding request for active replica", zap.String("replica", replica))
+			rwh.connTracker.activeLastRequestTimestamp = pointer.Time(time.Now())
+			rwh.sendChan <- request
+		} else {
+			logger.Debug("discarding request", zap.String("replica", replica))
+		}
+	}
+}
+
+func (rwh *RemoteWriteHandler) sendToTarget() {
+	for request := range rwh.sendChan {
+		req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(request.requestBody))
+		if err != nil {
+			panic("kaboom")
+		}
+		req.Header = request.requestHeaders
+		resp, err := rwh.client.Do(req)
+		if err != nil {
+			panic("more kaboom")
+		}
+		if resp.StatusCode > 299 {
+			logger.Error("got unexpected error code", zap.Int("status", resp.StatusCode))
+		}
 	}
 }
 
 func (rwh *RemoteWriteHandler) Dispatch() {
+	go rwh.sendToTarget()
 	for {
 		select {
-		case x := <-rwh.requestChan:
-			replicaHeader := x.requestHeaders.Get(HEADER_X_RIDLEY_REPLICA)
+		case request := <-rwh.requestChan:
+			replicaHeader := request.requestHeaders.Get(HEADER_X_RIDLEY_REPLICA)
 			logger.Debug("dispatch handling request", zap.String("replica", replicaHeader))
 
-			conntrackMutex := sync.Mutex{}
-			var conn chan RequestWthTimestamp
+			var requestQueue chan RequestWthTimestamp
 			var ok bool
-			conn, ok = rwh.conntrackTable[replicaHeader]
+			requestQueue, ok = rwh.connTracker.Get(replicaHeader)
 			if !ok {
 				logger.Info("creating new replica tracker", zap.String("replica", replicaHeader))
-				conn = make(chan RequestWthTimestamp)
-				conntrackMutex.Lock()
-				rwh.conntrackTable[replicaHeader] = conn
-				conntrackMutex.Unlock()
-				go processReplica(conn, &conntrackMutex)
+				var err error
+				requestQueue, err = rwh.connTracker.Add(replicaHeader)
+				if err != nil {
+					panic("tried to add an already existing replica")
+				}
+				go rwh.processReplica(requestQueue)
 			}
-			conn <- x
+			requestQueue <- request
 		case <-rwh.quitChan:
 			logger.Info("received shutdown signal")
 		}
 	}
 
+}
+
+func (ct *ConnTracker) Get(replica string) (requestQueue chan RequestWthTimestamp, ok bool) {
+	ct.mutex.Lock()
+	defer ct.mutex.Unlock()
+	requestQueue, ok = ct.conntrackTable[replica]
+	return requestQueue, ok
+}
+
+func (ct *ConnTracker) Add(replica string) (requestQueue chan RequestWthTimestamp, err error) {
+	ct.mutex.Lock()
+	defer ct.mutex.Unlock()
+	requestQueue = make(chan RequestWthTimestamp)
+	ct.conntrackTable[replica] = requestQueue
+	if ct.activeConnection == "" {
+		logger.Info("setting first observed replica to active", zap.String("replica", replica))
+		ct.activeConnection = replica
+	}
+	return requestQueue, nil
 }

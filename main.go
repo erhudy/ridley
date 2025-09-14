@@ -2,11 +2,16 @@ package main
 
 import (
 	"net/http"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
 
 var logger *zap.Logger
+
+var target string = "http://localhost:9090/api/v1/write"
+var timeoutDuration time.Duration = time.Second * 30
 
 func init() {
 	var err error
@@ -20,12 +25,18 @@ func main() {
 	client := http.Client{}
 	requestChan := make(chan RequestWthTimestamp)
 	quitChan := make(chan struct{})
+	sendChan := make(chan RequestWthTimestamp)
 
 	rwh := RemoteWriteHandler{
-		client:         &client,
-		conntrackTable: make(map[string]chan RequestWthTimestamp),
-		quitChan:       quitChan,
-		requestChan:    requestChan,
+		client: &client,
+		connTracker: &ConnTracker{
+			activeLastRequestTimestamp: nil,
+			conntrackTable:             make(map[string]chan RequestWthTimestamp),
+			mutex:                      &sync.Mutex{},
+		},
+		quitChan:    quitChan,
+		requestChan: requestChan,
+		sendChan:    sendChan,
 	}
 
 	// make sure to start dispatcher before starting the HTTP server so that channel does not deadlock

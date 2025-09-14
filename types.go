@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -11,11 +12,19 @@ type RequestWthTimestamp struct {
 	timestamp      time.Time
 }
 
+type ConnTracker struct {
+	activeConnection           string
+	activeLastRequestTimestamp *time.Time
+	conntrackTable             map[string]chan RequestWthTimestamp
+	mutex                      *sync.Mutex
+}
+
 type RemoteWriteHandler struct {
-	client         *http.Client
-	conntrackTable map[string]chan RequestWthTimestamp
-	quitChan       chan struct{}
-	requestChan    chan RequestWthTimestamp
+	client      *http.Client
+	connTracker *ConnTracker
+	quitChan    chan struct{}
+	requestChan chan RequestWthTimestamp
+	sendChan    chan RequestWthTimestamp
 }
 
 type RemoteAddr string
