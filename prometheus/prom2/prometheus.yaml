@@ -2,7 +2,7 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    prometheus_replica: replica-1
+    prometheus_replica: replica-2
 
 scrape_configs:
   - job_name: "prometheus-1"
@@ -15,5 +15,7 @@ scrape_configs:
 remote_write:
   # write to Ridley
   - url: http://host.docker.internal:8080/write
+    headers:
+      X-Ridley-Replica: replica-2
 #  - url: http://prometheus-central:9090/api/v1/write
 #    protobuf_message: io.prometheus.write.v2.Request
