@@ -6,7 +6,7 @@ services:
       - ./prom1:/etc/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yaml'
-      - '--web.listen-address=:9091'
+      - '--web.listen-address=0.0.0.0:9091'
       - '--storage.tsdb.path=/prometheus'
     ports:
       - 9091:9091
@@ -20,7 +20,7 @@ services:
       - ./prom2:/etc/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yaml'
-      - '--web.listen-address=:9092'
+      - '--web.listen-address=0.0.0.0:9092'
       - '--storage.tsdb.path=/prometheus'
     ports:
       - 9092:9092
@@ -34,7 +34,7 @@ services:
       - ./prom-recv:/etc/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yaml'
-      - '--web.listen-address=:9090'
+      - '--web.listen-address=0.0.0.0:9090'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-remote-write-receiver'
     ports:
