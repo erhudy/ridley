@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,16 +27,20 @@ func init() {
 }
 
 func main() {
-	client := http.Client{}
-	requestChan := make(chan RequestWthTimestamp)
-	quitChan := make(chan struct{})
-	sendChan := make(chan RequestWthTimestamp)
+	client := http.Client{
+		Timeout: 10 * time.Second,
+	}
+	requestChan := make(chan RequestWithTimestamp, 100)
+	sendChan := make(chan RequestWithTimestamp, 100)
+
+	quitChan := make(chan os.Signal, 1)
+	signal.Notify(quitChan, syscall.SIGINT, syscall.SIGTERM)
 
 	rwh := RemoteWriteHandler{
 		client: &client,
 		connTracker: &ConnTracker{
 			activeLastRequestTimestamp: nil,
-			conntrackTable:             make(map[string]chan RequestWthTimestamp),
+			conntrackTable:             make(map[string]chan RequestWithTimestamp),
 			mutex:                      &sync.Mutex{},
 		},
 		quitChan:    quitChan,
@@ -44,15 +53,26 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/write", &rwh)
-
 	server := &http.Server{
 		Addr:    "0.0.0.0:8080",
 		Handler: mux,
 	}
 
-	logger.Info("started on 0.0.0.0:8080")
+	go func() {
+		logger.Info("starting HTTP server")
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatal("HTTP server error", zap.Error(err))
+		}
+		logger.Info("shutting down gracefully")
+	}()
+	<-quitChan
+	logger.Info("received shutdown signal")
 
-	err := server.ListenAndServe()
-	quitChan <- struct{}{}
-	logger.Fatal(err.Error())
+	shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownRelease()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Fatal("HTTP server shutdown error", zap.Error(err))
+	}
+	logger.Info("graceful shutdown complete")
 }
