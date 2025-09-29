@@ -2,7 +2,6 @@ package main
 
 import (
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
@@ -23,7 +22,7 @@ type ConnTracker struct {
 type RemoteWriteHandler struct {
 	client      *http.Client
 	connTracker *ConnTracker
-	quitChan    chan os.Signal
+	quitChan    chan struct{}
 	requestChan chan RequestWithTimestamp
 	sendChan    chan RequestWithTimestamp
 }

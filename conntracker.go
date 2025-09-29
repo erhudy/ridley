@@ -44,3 +44,11 @@ func (ct *ConnTracker) SetActiveLastRequestTimestamp(t time.Time) {
 	defer ct.mutex.Unlock()
 	ct.activeLastRequestTimestamp = &t
 }
+
+func (ct *ConnTracker) Shutdown() {
+	ct.mutex.Lock()
+	defer ct.mutex.Unlock()
+	for _, x := range ct.conntrackTable {
+		close(x)
+	}
+}
