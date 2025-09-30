@@ -77,6 +77,7 @@ func (rwh *RemoteWriteHandler) Dispatch() {
 }
 
 func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimestamp, replica string) {
+	switchTimeout := v.GetDuration(FLAG_NAME_SWITCH_TIMEOUT)
 	for {
 		select {
 		case request := <-requestQueue:
@@ -87,8 +88,8 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 				logger.Info("last request timestamp is nil, still starting up")
 			} else {
 				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(*lrqTs)))
-				if time.Since(*lrqTs) > timeoutDuration {
-					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", timeoutDuration))
+				if time.Since(*lrqTs) > switchTimeout {
+					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", switchTimeout))
 					if rwh.connTracker.IsReplicaActive(replica) {
 						continue
 					} else {
@@ -114,6 +115,8 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 }
 
 func (rwh *RemoteWriteHandler) sendToTarget() {
+	target := v.GetString(FLAG_NAME_TARGET)
+	addlHeaders := v.GetStringMapString(FLAG_NAME_TARGET_HEADERS)
 	for request := range rwh.sendChan {
 		req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(request.requestBody))
 		if err != nil {
@@ -122,6 +125,9 @@ func (rwh *RemoteWriteHandler) sendToTarget() {
 			continue
 		}
 		req.Header = request.requestHeaders
+		for headerKey, headerValue := range addlHeaders {
+			req.Header.Set(headerKey, headerValue)
+		}
 		resp, err := rwh.client.Do(req)
 		if err != nil {
 			logger.Error("failed to send HTTP request", zap.Error(err))

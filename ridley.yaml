@@ -1,0 +1,4 @@
+---
+channel-length: 200
+switch-timeout: 20s
+target-headers: test-header-1=blah,test-header-2=eep
