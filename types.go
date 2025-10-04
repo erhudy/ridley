@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type RequestWthTimestamp struct {
+type RequestWithTimestamp struct {
 	requestBody    []byte
 	requestHeaders http.Header
 	timestamp      time.Time
@@ -15,7 +15,7 @@ type RequestWthTimestamp struct {
 type ConnTracker struct {
 	activeConnection           string
 	activeLastRequestTimestamp *time.Time
-	conntrackTable             map[string]chan RequestWthTimestamp
+	conntrackTable             map[string]chan RequestWithTimestamp
 	mutex                      *sync.Mutex
 }
 
@@ -23,8 +23,8 @@ type RemoteWriteHandler struct {
 	client      *http.Client
 	connTracker *ConnTracker
 	quitChan    chan struct{}
-	requestChan chan RequestWthTimestamp
-	sendChan    chan RequestWthTimestamp
+	requestChan chan RequestWithTimestamp
+	sendChan    chan RequestWithTimestamp
 }
 
 type RemoteAddr string
