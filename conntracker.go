@@ -6,14 +6,14 @@ import (
 	"go.uber.org/zap"
 )
 
-func (ct *ConnTracker) GetOrCreate(replica string) (chan RequestWithTimestamp, bool) {
+func (ct *ConnTracker) GetOrCreate(replica string, length int) (chan RequestWithTimestamp, bool) {
 	ct.mutex.Lock()
 	defer ct.mutex.Unlock()
 	if requestQueue, exists := ct.conntrackTable[replica]; exists {
 		return requestQueue, true
 	}
 	logger.Info("creating new replica tracker", zap.String("replica", replica))
-	ct.conntrackTable[replica] = make(chan RequestWithTimestamp, 100)
+	ct.conntrackTable[replica] = make(chan RequestWithTimestamp, length)
 	if ct.activeConnection == "" {
 		logger.Info("setting first observed replica to active", zap.String("replica", replica))
 		ct.activeConnection = replica
@@ -33,7 +33,7 @@ func (ct *ConnTracker) IsReplicaActive(replica string) bool {
 	return ct.activeConnection == replica
 }
 
-func (ct *ConnTracker) GetActiveLastRequestTimestamp() *time.Time {
+func (ct *ConnTracker) GetActiveLastRequestTimestamp() time.Time {
 	ct.mutex.Lock()
 	defer ct.mutex.Unlock()
 	return ct.activeLastRequestTimestamp
@@ -42,7 +42,7 @@ func (ct *ConnTracker) GetActiveLastRequestTimestamp() *time.Time {
 func (ct *ConnTracker) SetActiveLastRequestTimestamp(t time.Time) {
 	ct.mutex.Lock()
 	defer ct.mutex.Unlock()
-	ct.activeLastRequestTimestamp = &t
+	ct.activeLastRequestTimestamp = t
 }
 
 func (ct *ConnTracker) Shutdown() {

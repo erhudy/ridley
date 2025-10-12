@@ -23,6 +23,7 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		"X-Prometheus-Remote-Write-Version":["0.1.0"]
 	}
 	*/
+	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -57,7 +58,7 @@ func (rwh *RemoteWriteHandler) Dispatch() {
 			replica := request.requestHeaders.Get(HEADER_X_RIDLEY_REPLICA)
 			// for some reason during shutdown we get a request with no replica header set so if replica is "" just skip
 			if replica != "" {
-				requestQueue, exists := rwh.connTracker.GetOrCreate(replica)
+				requestQueue, exists := rwh.connTracker.GetOrCreate(replica, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
 				if !exists {
 					logger.Info("spawning new process replica", zap.String("replica", replica))
 					wg.Go(func() { rwh.processReplica(requestQueue, replica) })
@@ -84,11 +85,11 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 			logger.Debug("processReplica handling request", zap.String("replica", replica))
 
 			lrqTs := rwh.connTracker.GetActiveLastRequestTimestamp()
-			if lrqTs == nil {
+			if lrqTs.IsZero() {
 				logger.Info("last request timestamp is nil, still starting up")
 			} else {
-				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(*lrqTs)))
-				if time.Since(*lrqTs) > switchTimeout {
+				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(lrqTs)))
+				if time.Since(lrqTs) > switchTimeout {
 					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", switchTimeout))
 					if rwh.connTracker.IsReplicaActive(replica) {
 						continue
@@ -124,17 +125,19 @@ func (rwh *RemoteWriteHandler) sendToTarget() {
 			metric_SendErrorsTotal.WithLabelValues("599").Inc()
 			continue
 		}
-		req.Header = request.requestHeaders
+		req.Header = request.requestHeaders.Clone()
 		for headerKey, headerValue := range addlHeaders {
 			req.Header.Set(headerKey, headerValue)
 		}
 		resp, err := rwh.client.Do(req)
 		if err != nil {
+			resp.Body.Close()
 			logger.Error("failed to send HTTP request", zap.Error(err))
 			metric_SendErrorsTotal.WithLabelValues("599").Inc()
 			continue
 		}
 		if resp.StatusCode > 299 {
+			resp.Body.Close()
 			logger.Error("got unexpected error code", zap.Int("status", resp.StatusCode))
 			metric_SendErrorsTotal.WithLabelValues(fmt.Sprintf("%d", resp.StatusCode)).Inc()
 			continue

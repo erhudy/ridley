@@ -135,7 +135,7 @@ func main() {
 	rwh := RemoteWriteHandler{
 		client: &client,
 		connTracker: &ConnTracker{
-			activeLastRequestTimestamp: nil,
+			activeLastRequestTimestamp: time.Time{},
 			conntrackTable:             make(map[string]chan RequestWithTimestamp),
 			mutex:                      &sync.Mutex{},
 		},

@@ -14,7 +14,7 @@ type RequestWithTimestamp struct {
 
 type ConnTracker struct {
 	activeConnection           string
-	activeLastRequestTimestamp *time.Time
+	activeLastRequestTimestamp time.Time
 	conntrackTable             map[string]chan RequestWithTimestamp
 	mutex                      *sync.Mutex
 }
