@@ -23,17 +23,17 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		"X-Prometheus-Remote-Write-Version":["0.1.0"]
 	}
 	*/
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "error processing request: %s", err.Error())
+		_, _ = fmt.Fprintf(w, "error processing request: %s", err.Error())
 		metric_FailedIncomingRequestsTotal.WithLabelValues().Inc()
 		return
 	}
 	if r.Header.Get(HEADER_X_RIDLEY_REPLICA) == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "%s header must be set on every request", HEADER_X_RIDLEY_REPLICA)
+		_, _ = fmt.Fprintf(w, "%s header must be set on every request", HEADER_X_RIDLEY_REPLICA)
 		metric_FailedIncomingRequestsTotal.WithLabelValues().Inc()
 		return
 	}
@@ -61,7 +61,11 @@ func (rwh *RemoteWriteHandler) Dispatch() {
 				requestQueue, exists := rwh.connTracker.GetOrCreate(replica, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
 				if !exists {
 					logger.Info("spawning new process replica", zap.String("replica", replica))
-					wg.Go(func() { rwh.processReplica(requestQueue, replica) })
+					wg.Add(1)
+					go func(q chan RequestWithTimestamp, rep string) {
+						defer wg.Done()
+						rwh.processReplica(q, rep)
+					}(requestQueue, replica)
 				}
 				requestQueue <- request
 			}
@@ -69,9 +73,12 @@ func (rwh *RemoteWriteHandler) Dispatch() {
 				rwh.connTracker.Shutdown()
 				wg.Wait()
 				close(rwh.sendChan)
+				if rwh.dispatchDone != nil {
+					close(rwh.dispatchDone)
+				}
 				return
 			}
-		case <-rwh.quitChan:
+		case <-rwh.ctx.Done():
 			stopping = true
 		}
 	}
@@ -107,7 +114,7 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 			} else {
 				logger.Debug("discarding request", zap.String("replica", replica))
 			}
-		case <-rwh.quitChan:
+		case <-rwh.ctx.Done():
 			logger.Info("stopping process replica", zap.String("replica", replica))
 			return
 		}
@@ -131,17 +138,20 @@ func (rwh *RemoteWriteHandler) sendToTarget() {
 		}
 		resp, err := rwh.client.Do(req)
 		if err != nil {
-			resp.Body.Close()
 			logger.Error("failed to send HTTP request", zap.Error(err))
 			metric_SendErrorsTotal.WithLabelValues("599").Inc()
 			continue
 		}
+		// Ensure body is closed for every response
+		if resp != nil && resp.Body != nil {
+			if err := resp.Body.Close(); err != nil {
+				logger.Debug("failed to close response body", zap.Error(err))
+			}
+		}
 		if resp.StatusCode > 299 {
-			resp.Body.Close()
 			logger.Error("got unexpected error code", zap.Int("status", resp.StatusCode))
 			metric_SendErrorsTotal.WithLabelValues(fmt.Sprintf("%d", resp.StatusCode)).Inc()
 			continue
 		}
-		resp.Body.Close()
 	}
 }

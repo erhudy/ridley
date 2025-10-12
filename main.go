@@ -63,7 +63,9 @@ func init() {
 
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
-	v.BindPFlags(pflag.CommandLine)
+	if err := v.BindPFlags(pflag.CommandLine); err != nil {
+		logger.Warn("failed to bind pflags to viper", zap.Error(err))
+	}
 
 	var err error
 	logger, err = zap.NewProduction()
@@ -127,7 +129,9 @@ func main() {
 	}
 	requestChan := make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
 	sendChan := make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
-	quitChan := make(chan struct{}, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dispatchDone := make(chan struct{})
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
@@ -137,11 +141,12 @@ func main() {
 		connTracker: &ConnTracker{
 			activeLastRequestTimestamp: time.Time{},
 			conntrackTable:             make(map[string]chan RequestWithTimestamp),
-			mutex:                      &sync.Mutex{},
+			mutex:                      sync.Mutex{},
 		},
-		quitChan:    quitChan,
-		requestChan: requestChan,
-		sendChan:    sendChan,
+		ctx:          ctx,
+		requestChan:  requestChan,
+		sendChan:     sendChan,
+		dispatchDone: dispatchDone,
 	}
 
 	// make sure to start dispatcher before starting the HTTP server so that channel does not deadlock
@@ -164,18 +169,16 @@ func main() {
 	}()
 	<-signalChan
 	logger.Info("received shutdown signal")
-	go func() {
-		for {
-			quitChan <- struct{}{}
-		}
-	}()
 
+	// stop accepting new HTTP connections
 	shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownRelease()
-
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal("HTTP server shutdown error", zap.Error(err))
 	}
-	close(requestChan)
+
+	// signal dispatcher to stop and wait for it to finish via context cancellation
+	cancel()
+	<-dispatchDone
 	logger.Info("graceful shutdown complete")
 }
