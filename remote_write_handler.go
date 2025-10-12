@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,11 +48,10 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (rwh *RemoteWriteHandler) Dispatch() {
+func (rwh *RemoteWriteHandler) Dispatch(ctx context.Context) {
 	logger.Debug("starting dispatch")
 	wg := sync.WaitGroup{}
 	go rwh.sendToTarget()
-	stopping := false
 	for {
 		select {
 		case request := <-rwh.requestChan:
@@ -62,29 +62,26 @@ func (rwh *RemoteWriteHandler) Dispatch() {
 				if !exists {
 					logger.Info("spawning new process replica", zap.String("replica", replica))
 					wg.Add(1)
-					go func(q chan RequestWithTimestamp, rep string) {
+					go func(q chan RequestWithTimestamp, rep string, ctx context.Context) {
 						defer wg.Done()
-						rwh.processReplica(q, rep)
-					}(requestQueue, replica)
+						rwh.processReplica(q, rep, ctx)
+					}(requestQueue, replica, ctx)
 				}
 				requestQueue <- request
 			}
-			if stopping {
-				rwh.connTracker.Shutdown()
-				wg.Wait()
-				close(rwh.sendChan)
-				if rwh.dispatchDone != nil {
-					close(rwh.dispatchDone)
-				}
-				return
+		case <-ctx.Done():
+			rwh.connTracker.Shutdown()
+			wg.Wait()
+			close(rwh.sendChan)
+			if rwh.dispatchDone != nil {
+				close(rwh.dispatchDone)
 			}
-		case <-rwh.ctx.Done():
-			stopping = true
+			return
 		}
 	}
 }
 
-func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimestamp, replica string) {
+func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimestamp, replica string, ctx context.Context) {
 	switchTimeout := v.GetDuration(FLAG_NAME_SWITCH_TIMEOUT)
 	for {
 		select {
@@ -93,7 +90,7 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 
 			lrqTs := rwh.connTracker.GetActiveLastRequestTimestamp()
 			if lrqTs.IsZero() {
-				logger.Info("last request timestamp is nil, still starting up")
+				logger.Info("last request timestamp is nil, first request being processed")
 			} else {
 				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(lrqTs)))
 				if time.Since(lrqTs) > switchTimeout {
@@ -114,7 +111,7 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 			} else {
 				logger.Debug("discarding request", zap.String("replica", replica))
 			}
-		case <-rwh.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("stopping process replica", zap.String("replica", replica))
 			return
 		}

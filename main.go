@@ -150,7 +150,7 @@ func main() {
 	}
 
 	// make sure to start dispatcher before starting the HTTP server so that channel does not deadlock
-	go rwh.Dispatch()
+	go rwh.Dispatch(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/write", &rwh)
@@ -167,6 +167,7 @@ func main() {
 		}
 		logger.Info("shutting down gracefully")
 	}()
+
 	<-signalChan
 	logger.Info("received shutdown signal")
 
