@@ -49,7 +49,7 @@ var (
 func init() {
 	v = viper.New()
 	v.SetEnvPrefix("ridley")
-	v.SetConfigName("ridley")
+	v.SetConfigName("ridley-config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath(".")
 
