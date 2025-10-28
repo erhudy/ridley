@@ -38,6 +38,12 @@ var (
 		},
 		[]string{"replica"},
 	)
+	metric_LastRequestSeen = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ridley_last_request_seen_timestamp_seconds",
+		},
+		[]string{"replica"},
+	)
 	metric_SendErrorsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ridley_send_errors_total",

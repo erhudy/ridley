@@ -30,11 +30,9 @@ func (rwh *RemoteWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		metric_FailedIncomingRequestsTotal.WithLabelValues().Inc()
 		return
 	}
+	// if the replica header isn't set then we will substitute in the host:port instead
 	if r.Header.Get(HEADER_X_RIDLEY_REPLICA) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "%s header must be set on every request", HEADER_X_RIDLEY_REPLICA)
-		metric_FailedIncomingRequestsTotal.WithLabelValues().Inc()
-		return
+		r.Header.Set(HEADER_X_RIDLEY_REPLICA, r.RemoteAddr)
 	}
 	req := RequestWithTimestamp{
 		requestBody:    body,
@@ -89,7 +87,7 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 			} else {
 				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(*lrqTs)))
 				if time.Since(*lrqTs) > switchTimeout {
-					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", switchTimeout))
+					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", switchTimeout), zap.String("newActive", replica))
 					if rwh.connTracker.IsReplicaActive(replica) {
 						continue
 					} else {
@@ -99,6 +97,8 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 			}
 
 			metric_IncomingRequestsTotal.WithLabelValues(replica).Inc()
+			metric_LastRequestSeen.WithLabelValues(replica).Set(float64(request.timestamp.Unix()))
+
 			if rwh.connTracker.IsReplicaActive(replica) {
 				logger.Debug("forwarding request for active replica", zap.String("replica", replica))
 				rwh.connTracker.SetActiveLastRequestTimestamp(time.Now())

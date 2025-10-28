@@ -14,5 +14,5 @@ scrape_configs:
 
 remote_write:
   - url: http://host.docker.internal:8080/write
-    headers:
-      X-Ridley-Replica: replica-2
+    # headers:
+    #   X-Ridley-Replica: replica-2
