@@ -85,16 +85,13 @@ func (rwh *RemoteWriteHandler) processReplica(requestQueue chan RequestWithTimes
 
 			lrqTs := rwh.connTracker.GetActiveLastRequestTimestamp()
 			if lrqTs == nil {
-				logger.Info("last request timestamp is nil, still starting up")
+				logger.Info("first request received for replica", zap.String("replica", replica))
 			} else {
 				logger.Debug("time since last request forwarded", zap.Duration("duration", time.Since(*lrqTs)))
 				if time.Since(*lrqTs) > switchTimeout {
 					logger.Warn("switching active replica due to timeout of previous active", zap.Duration("timeoutDuration", switchTimeout))
-					if rwh.connTracker.IsReplicaActive(replica) {
-						continue
-					} else {
-						rwh.connTracker.SetActiveConnection(replica)
-					}
+					rwh.connTracker.SetActiveConnection(replica)
+					logger.Warn("new active replica", zap.String("replica", replica))
 				}
 			}
 

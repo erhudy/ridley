@@ -13,7 +13,7 @@ func (ct *ConnTracker) GetOrCreate(replica string) (chan RequestWithTimestamp, b
 		return requestQueue, true
 	}
 	logger.Info("creating new replica tracker", zap.String("replica", replica))
-	ct.conntrackTable[replica] = make(chan RequestWithTimestamp, 100)
+	ct.conntrackTable[replica] = make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
 	if ct.activeConnection == "" {
 		logger.Info("setting first observed replica to active", zap.String("replica", replica))
 		ct.activeConnection = replica
