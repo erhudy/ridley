@@ -74,10 +74,11 @@ func (rwh *RemoteWriteHandler) HandleRequest(w http.ResponseWriter, headers http
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
 			logger.Errorw("failed to read response body", "error", err)
-		} else {
-			w.Write(respBody)
+			w.WriteHeader(resp.StatusCode)
+			return
 		}
 		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
 	} else {
 		logger.Debugw("discarding request", "replica", replica)
 		w.WriteHeader(http.StatusAccepted)
