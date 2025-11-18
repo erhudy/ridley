@@ -1,54 +1,48 @@
 package main
 
 import (
+	"sync"
 	"time"
-
-	"go.uber.org/zap"
 )
 
-func (ct *ConnTracker) GetOrCreate(replica string) (chan RequestWithTimestamp, bool) {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	if requestQueue, exists := ct.conntrackTable[replica]; exists {
-		return requestQueue, true
+type ConnTracker struct {
+	ActiveConnection      *string
+	connectionTimeout     time.Duration
+	activeLastRequestTime time.Time
+	mutex                 *sync.Mutex
+}
+
+func NewConnTracker(timeout time.Duration) *ConnTracker {
+	return &ConnTracker{
+		ActiveConnection:      nil,
+		connectionTimeout:     timeout,
+		activeLastRequestTime: time.Time{},
+		mutex:                 &sync.Mutex{},
 	}
-	logger.Info("creating new replica tracker", zap.String("replica", replica))
-	ct.conntrackTable[replica] = make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
-	if ct.activeConnection == "" {
-		logger.Info("setting first observed replica to active", zap.String("replica", replica))
-		ct.activeConnection = replica
+}
+
+func (ct *ConnTracker) TrySetActiveConnection(replica string, requestTime time.Time) bool {
+	ct.mutex.Lock()
+	defer ct.mutex.Unlock()
+	if ct.ActiveConnection == nil {
+		logger.Infow("setting first active connection", "replica", replica)
+		ct.ActiveConnection = &replica
+		ct.activeLastRequestTime = requestTime
+		return true
 	}
-	return ct.conntrackTable[replica], false
-}
 
-func (ct *ConnTracker) SetActiveConnection(replica string) {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	ct.activeConnection = replica
-}
-
-func (ct *ConnTracker) IsReplicaActive(replica string) bool {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	return ct.activeConnection == replica
-}
-
-func (ct *ConnTracker) GetActiveLastRequestTimestamp() *time.Time {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	return ct.activeLastRequestTimestamp
-}
-
-func (ct *ConnTracker) SetActiveLastRequestTimestamp(t time.Time) {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	ct.activeLastRequestTimestamp = &t
-}
-
-func (ct *ConnTracker) Shutdown() {
-	ct.mutex.Lock()
-	defer ct.mutex.Unlock()
-	for _, x := range ct.conntrackTable {
-		close(x)
+	if *ct.ActiveConnection == replica {
+		logger.Debugw("replica already active", "replica", replica)
+		ct.activeLastRequestTime = requestTime
+		return true
 	}
+
+	if requestTime.Sub(ct.activeLastRequestTime) > ct.connectionTimeout {
+		logger.Infow("timeout exceeded since last replica request, switching active replica", "prevReplica", *ct.ActiveConnection, "newReplica", replica)
+		ct.ActiveConnection = &replica
+		ct.activeLastRequestTime = requestTime
+		return true
+	}
+
+	return false
 }

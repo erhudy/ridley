@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -21,7 +20,7 @@ import (
 	"go.uber.org/zap"
 )
 
-var logger *zap.Logger
+var logger *zap.SugaredLogger
 var v *viper.Viper
 
 // metrics variables
@@ -53,7 +52,6 @@ func init() {
 	v.SetConfigType("yaml")
 	v.AddConfigPath(".")
 
-	flag.Int(FLAG_NAME_CHANNEL_LENGTH, FLAG_DEFAULT_CHANNEL_LENGTH, "Set the length of the internal buffered channels")
 	flag.Duration(FLAG_NAME_CLIENT_TIMEOUT, FLAG_DEFAULT_CLIENT_TIMEOUT, "Set the timeout of the HTTP client that sends to the target")
 	flag.Bool(FLAG_NAME_DEBUG, FLAG_DEFAULT_DEBUG, "Log in debug mode")
 	flag.String(FLAG_NAME_LISTEN_ADDRESS, FLAG_DEFAULT_LISTEN_ADDRESS, "Set listen address for Ridley")
@@ -66,10 +64,11 @@ func init() {
 	v.BindPFlags(pflag.CommandLine)
 
 	var err error
-	logger, err = zap.NewProduction()
+	rawLogger, err := zap.NewProduction()
 	if err != nil {
 		panic(err)
 	}
+	logger = rawLogger.Sugar()
 	metric_FailedIncomingRequestsTotal.WithLabelValues().Add(0)
 
 	v.AutomaticEnv()
@@ -85,10 +84,11 @@ func init() {
 
 	// replace the logger here now that we've gone through all config options and can tell for certain if we should be in debug mode
 	if v.GetBool(FLAG_NAME_DEBUG) {
-		logger, err = zap.NewDevelopment()
+		rawLogger, err = zap.NewDevelopment()
 		if err != nil {
 			panic(err)
 		}
+		logger = rawLogger.Sugar()
 	}
 
 	targetHeadersString := v.GetString(FLAG_NAME_TARGET_HEADERS)
@@ -118,34 +118,18 @@ func init() {
 	loadedSettings := v.AllSettings()
 	// AllSettings lowercases the keys so do it lowercased here
 	loadedSettings[FLAG_NAME_TARGET_HEADERS] = targetHeaders
-	logger.Info("config settings", zap.Any("settings", loadedSettings))
+	logger.Infow("config settings", "settings", loadedSettings)
 }
 
 func main() {
 	client := http.Client{
 		Timeout: v.GetDuration(FLAG_NAME_CLIENT_TIMEOUT),
 	}
-	requestChan := make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
-	sendChan := make(chan RequestWithTimestamp, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
-	quitChan := make(chan struct{}, v.GetInt(FLAG_NAME_CHANNEL_LENGTH))
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	rwh := RemoteWriteHandler{
-		client: &client,
-		connTracker: &ConnTracker{
-			activeLastRequestTimestamp: nil,
-			conntrackTable:             make(map[string]chan RequestWithTimestamp),
-			mutex:                      &sync.Mutex{},
-		},
-		quitChan:    quitChan,
-		requestChan: requestChan,
-		sendChan:    sendChan,
+		client:      &client,
+		connTracker: NewConnTracker(v.GetDuration(FLAG_NAME_SWITCH_TIMEOUT)),
 	}
-
-	// make sure to start dispatcher before starting the HTTP server so that channel does not deadlock
-	go rwh.Dispatch()
 
 	mux := http.NewServeMux()
 	mux.Handle("/write", &rwh)
@@ -155,6 +139,9 @@ func main() {
 		Handler: mux,
 	}
 
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
 		logger.Info("starting HTTP server")
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -163,19 +150,13 @@ func main() {
 		logger.Info("shutting down gracefully")
 	}()
 	<-signalChan
-	logger.Info("received shutdown signal")
-	go func() {
-		for {
-			quitChan <- struct{}{}
-		}
-	}()
 
+	logger.Info("received shutdown signal")
 	shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownRelease()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Fatal("HTTP server shutdown error", zap.Error(err))
+		logger.Fatalw("HTTP server shutdown error", "error", err.Error())
 	}
-	close(requestChan)
 	logger.Info("graceful shutdown complete")
 }
