@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -23,27 +22,42 @@ import (
 var logger *zap.SugaredLogger
 var v *viper.Viper
 
-// metrics variables
-var (
-	metric_FailedIncomingRequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ridley_failed_incoming_requests_total",
-		},
-		[]string{},
-	)
-	metric_IncomingRequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ridley_incoming_requests_total",
-		},
-		[]string{"replica"},
-	)
-	metric_SendErrorsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ridley_send_errors_total",
-		},
-		[]string{"code"},
-	)
-)
+type RidleyMetrics struct {
+	FailedIncomingRequestsTotal *prometheus.CounterVec
+	IncomingRequestsTotal       *prometheus.CounterVec
+	SendErrorsTotal             *prometheus.CounterVec
+}
+
+func NewRidleyMetrics(reg prometheus.Registerer) *RidleyMetrics {
+	m := &RidleyMetrics{
+		FailedIncomingRequestsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "ridley_failed_incoming_requests_total"}, []string{}),
+		IncomingRequestsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "ridley_incoming_requests_total"}, []string{"replica"}),
+		SendErrorsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "ridley_send_errors_total"}, []string{"code"}),
+	}
+	reg.MustRegister(m.FailedIncomingRequestsTotal, m.IncomingRequestsTotal, m.SendErrorsTotal)
+	m.FailedIncomingRequestsTotal.WithLabelValues().Add(0)
+	return m
+}
+
+func parseTargetHeaders(raw string) (map[string]string, error) {
+	result := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(strings.TrimSpace(entry), "=")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("unable to process target headers entry: %v", parts)
+		}
+		key := strings.TrimSpace(strings.Trim(strings.TrimSpace(parts[0]), "'\""))
+		value := strings.TrimSpace(strings.Trim(strings.TrimSpace(parts[1]), "'\""))
+		result[key] = value
+	}
+	return result, nil
+}
 
 func init() {
 	v = viper.New()
@@ -58,10 +72,14 @@ func init() {
 	flag.Duration(FLAG_NAME_SWITCH_TIMEOUT, FLAG_DEFAULT_SWITCH_TIMEOUT, "Set timeout after which Ridley will switch to a different stream")
 	flag.String(FLAG_NAME_TARGET, FLAG_DEFAULT_TARGET, "Set address of target to send to")
 	flag.String(FLAG_NAME_TARGET_HEADERS, FLAG_DEFAULT_TARGET_HEADERS, "Set headers to add to requests being sent to the target in the form \"key1=val1,key2=val2\"")
+}
 
+func main() {
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
-	v.BindPFlags(pflag.CommandLine)
+	if err := v.BindPFlags(pflag.CommandLine); err != nil {
+		panic(fmt.Errorf("failed to bind pflags: %w", err))
+	}
 
 	var err error
 	rawLogger, err := zap.NewProduction()
@@ -69,7 +87,6 @@ func init() {
 		panic(err)
 	}
 	logger = rawLogger.Sugar()
-	metric_FailedIncomingRequestsTotal.WithLabelValues().Add(0)
 
 	v.AutomaticEnv()
 	if err = v.ReadInConfig(); err == nil {
@@ -91,21 +108,9 @@ func init() {
 		logger = rawLogger.Sugar()
 	}
 
-	targetHeadersString := v.GetString(FLAG_NAME_TARGET_HEADERS)
-	targetHeadersMap := make(map[string]string)
-	afterSplit := strings.Split(targetHeadersString, ",")
-	for _, entry := range afterSplit {
-		if entry == "" {
-			continue
-		}
-		entryTrimmed := strings.TrimSpace(entry)
-		entrySplit := strings.Split(entryTrimmed, "=")
-		if len(entrySplit) != 2 {
-			panic(fmt.Errorf("unable to process target headers entry: %v", entrySplit))
-		}
-		key := strings.TrimSpace(strings.TrimRight(strings.TrimLeft(strings.TrimSpace(entrySplit[0]), "'\""), "'\""))
-		value := strings.TrimSpace(strings.TrimRight(strings.TrimLeft(strings.TrimSpace(entrySplit[1]), "'\""), "'\""))
-		targetHeadersMap[key] = value
+	targetHeadersMap, err := parseTargetHeaders(v.GetString(FLAG_NAME_TARGET_HEADERS))
+	if err != nil {
+		panic(err)
 	}
 	v.Set(FLAG_NAME_TARGET_HEADERS, targetHeadersMap)
 
@@ -119,16 +124,19 @@ func init() {
 	// AllSettings lowercases the keys so do it lowercased here
 	loadedSettings[FLAG_NAME_TARGET_HEADERS] = targetHeaders
 	logger.Infow("config settings", "settings", loadedSettings)
-}
 
-func main() {
 	client := http.Client{
 		Timeout: v.GetDuration(FLAG_NAME_CLIENT_TIMEOUT),
 	}
 
+	metrics := NewRidleyMetrics(prometheus.DefaultRegisterer)
 	rwh := RemoteWriteHandler{
 		client:      &client,
-		connTracker: NewConnTracker(v.GetDuration(FLAG_NAME_SWITCH_TIMEOUT)),
+		connTracker: NewConnTracker(v.GetDuration(FLAG_NAME_SWITCH_TIMEOUT), logger),
+		target:      v.GetString(FLAG_NAME_TARGET),
+		addlHeaders: v.GetStringMapString(FLAG_NAME_TARGET_HEADERS),
+		logger:      logger,
+		metrics:     metrics,
 	}
 
 	mux := http.NewServeMux()
