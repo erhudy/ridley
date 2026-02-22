@@ -1,6 +1,6 @@
 module github.com/erhudy/ridley
 
-go 1.25
+go 1.25.7
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
